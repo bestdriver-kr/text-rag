@@ -24,6 +24,20 @@ except ImportError as e:
     DEPS_OK = False
     DEPS_ERROR = str(e)
 
+try:
+    from openai import OpenAI as _OpenAIClient
+    OPENAI_OK = True
+except ImportError:
+    OPENAI_OK = False
+
+# 지원 제공자 정의
+PROVIDERS = {
+    "Ollama":     {"url": "http://localhost:11434", "port": 11434},
+    "LM Studio":  {"url": "http://localhost:1234/v1", "port": 1234},
+    "Jan":        {"url": "http://localhost:1337/v1", "port": 1337},
+    "직접 입력":  {"url": "", "port": None},
+}
+
 BASE_DIR = Path(__file__).parent
 CONFIG_FILE = BASE_DIR / "config.json"
 CONV_FILE  = BASE_DIR / "conversations.json"
@@ -39,7 +53,7 @@ def load_config():
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
-    return {"folder": "", "model": "gemma3:4b"}
+    return {"folder": "", "model": "gemma3:4b", "provider": "Ollama", "base_url": ""}
 
 def save_config(cfg):
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
@@ -144,7 +158,15 @@ def index_documents(folder, callback=None, force=False):
 
     return added, skipped, errors
 
-def query_documents(question, model, top_k=5):
+def _fetch_models_openai(base_url: str) -> list[str]:
+    """LM Studio / Jan 등 OpenAI 호환 서버에서 모델 목록 조회"""
+    try:
+        c = _OpenAIClient(base_url=base_url, api_key="not-needed")
+        return [m.id for m in c.models.list().data]
+    except Exception:
+        return []
+
+def query_documents(question, model, top_k=5, provider="Ollama", base_url=""):
     try:
         client = chromadb.PersistentClient(path=DB_PATH)
         col = client.get_collection(COLLECTION)
@@ -153,6 +175,7 @@ def query_documents(question, model, top_k=5):
     except Exception:
         return "문서가 인덱싱되지 않았습니다. 설정 → 인덱싱을 먼저 실행하세요.", []
 
+    # 임베딩은 항상 Ollama 사용
     try:
         q_emb = ollama.embeddings(model=EMBED_MODEL, prompt=question)["embedding"]
     except Exception as e:
@@ -179,10 +202,22 @@ def query_documents(question, model, top_k=5):
         "문서에 없는 내용은 \"문서에서 찾을 수 없습니다\"라고 답하세요.\n\n"
         f"질문: {question}\n\n답변:"
     )
+
     try:
-        return ollama.generate(model=model, prompt=prompt)["response"], sources
+        if provider == "Ollama":
+            return ollama.generate(model=model, prompt=prompt)["response"], sources
+        else:
+            # LM Studio / Jan / 직접 입력 — OpenAI 호환 API
+            if not OPENAI_OK:
+                return "openai 패키지가 없습니다. setup.bat 을 실행하세요.", []
+            c = _OpenAIClient(base_url=base_url, api_key="not-needed")
+            resp = c.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return resp.choices[0].message.content, sources
     except Exception as e:
-        return f"LLM 오류: {e}", []
+        return f"LLM 오류 ({provider}): {e}", []
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
 C = {
@@ -413,11 +448,12 @@ class OllamaRAGApp:
 
     # ── 상태 바 ──────────────────────────────────────────────────────────────
     def _refresh_status(self):
-        folder = self.config.get("folder", "")
-        model  = self.config.get("model", "gemma3:4b")
+        folder   = self.config.get("folder", "")
+        model    = self.config.get("model", "gemma3:4b")
+        provider = self.config.get("provider", "Ollama")
         if folder:
             self.status_lbl.config(
-                text=f"📁 {Path(folder).name}   🤖 {model}")
+                text=f"📁 {Path(folder).name}   🤖 {model}   🔌 {provider}")
         else:
             self.status_lbl.config(text="⚙  설정에서 폴더를 지정하세요")
 
@@ -593,11 +629,14 @@ class OllamaRAGApp:
         self.busy = True
         self.send_btn.config(state=tk.DISABLED, text="처리 중…")
 
-        model  = self.config.get("model", "gemma3:4b")
-        cid    = self.current_id
+        model    = self.config.get("model", "gemma3:4b")
+        provider = self.config.get("provider", "Ollama")
+        base_url = self.config.get("base_url", "")
+        cid      = self.current_id
 
         def _worker():
-            answer, sources = query_documents(question, model)
+            answer, sources = query_documents(question, model,
+                                              provider=provider, base_url=base_url)
             self.root.after(0, lambda: self._on_answer(cid, answer, sources))
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -624,7 +663,7 @@ class OllamaRAGApp:
     def _show_settings(self):
         dlg = tk.Toplevel(self.root)
         dlg.title("설정")
-        dlg.geometry("540x460")
+        dlg.geometry("560x620")
         dlg.configure(bg=C["main"])
         dlg.resizable(False, False)
         dlg.transient(self.root)
@@ -633,7 +672,7 @@ class OllamaRAGApp:
         dlg.update_idletasks()
         rx, ry = self.root.winfo_x(), self.root.winfo_y()
         rw, rh = self.root.winfo_width(), self.root.winfo_height()
-        dlg.geometry(f"540x460+{rx + (rw-540)//2}+{ry + (rh-460)//2}")
+        dlg.geometry(f"560x620+{rx + (rw-560)//2}+{ry + (rh-620)//2}")
 
         tk.Label(dlg, text="설정",
                  bg=C["main"], fg=C["text"],
@@ -643,45 +682,6 @@ class OllamaRAGApp:
         body = tk.Frame(dlg, bg=C["main"])
         body.pack(fill=tk.BOTH, expand=True, padx=22)
 
-        # 폴더 선택
-        tk.Label(body, text="문서 폴더",
-                 bg=C["main"], fg=C["text2"],
-                 font=("Malgun Gothic", 9, "bold")).pack(anchor="w", pady=(0, 4))
-
-        folder_row = tk.Frame(body, bg=C["main"])
-        folder_row.pack(fill=tk.X, pady=(0, 18))
-
-        folder_var = tk.StringVar(value=self.config.get("folder", ""))
-        folder_ent = tk.Entry(folder_row, textvariable=folder_var,
-                              bg=C["input_bg"], fg=C["text"],
-                              insertbackground=C["text"],
-                              font=("Malgun Gothic", 10),
-                              relief=tk.FLAT, bd=4)
-        folder_ent.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
-
-        def _browse():
-            p = filedialog.askdirectory(title="문서 폴더 선택", parent=dlg)
-            if p:
-                folder_var.set(p)
-
-        tk.Button(folder_row, text="찾아보기",
-                  bg=C["btn"], fg="white",
-                  font=("Malgun Gothic", 9),
-                  relief=tk.FLAT, bd=0, padx=10, pady=4,
-                  cursor="hand2", command=_browse).pack(side=tk.LEFT, padx=(6, 0))
-
-        # 모델 선택
-        tk.Label(body, text="LLM 모델",
-                 bg=C["main"], fg=C["text2"],
-                 font=("Malgun Gothic", 9, "bold")).pack(anchor="w", pady=(0, 4))
-
-        model_var = tk.StringVar(value=self.config.get("model", "gemma3:4b"))
-        avail = [self.config.get("model", "gemma3:4b")]
-        try:
-            avail = [m.model for m in ollama.list().models]
-        except Exception:
-            pass
-
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("Dark.TCombobox",
@@ -690,22 +690,122 @@ class OllamaRAGApp:
                         foreground=C["text"],
                         arrowcolor=C["text"])
 
-        model_cb = ttk.Combobox(body, textvariable=model_var,
-                                values=avail,
-                                font=("Malgun Gothic", 10),
-                                state="readonly",
-                                style="Dark.TCombobox")
-        model_cb.pack(fill=tk.X, pady=(0, 20), ipady=4)
+        def _lbl(parent, text):
+            tk.Label(parent, text=text, bg=C["main"], fg=C["text2"],
+                     font=("Malgun Gothic", 9, "bold")).pack(anchor="w", pady=(0, 4))
 
-        # 인덱싱
+        def _entry(parent, var, **kw):
+            e = tk.Entry(parent, textvariable=var,
+                         bg=C["input_bg"], fg=C["text"],
+                         insertbackground=C["text"],
+                         font=("Malgun Gothic", 10),
+                         relief=tk.FLAT, bd=4, **kw)
+            return e
+
+        def _combo(parent, var, values):
+            cb = ttk.Combobox(parent, textvariable=var, values=values,
+                              font=("Malgun Gothic", 10),
+                              state="readonly", style="Dark.TCombobox")
+            cb.pack(fill=tk.X, pady=(0, 14), ipady=4)
+            return cb
+
+        # ── 폴더 선택 ──
+        _lbl(body, "문서 폴더")
+        folder_row = tk.Frame(body, bg=C["main"])
+        folder_row.pack(fill=tk.X, pady=(0, 14))
+        folder_var = tk.StringVar(value=self.config.get("folder", ""))
+        _entry(folder_row, folder_var).pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
+
+        def _browse():
+            p = filedialog.askdirectory(title="문서 폴더 선택", parent=dlg)
+            if p:
+                folder_var.set(p)
+
+        tk.Button(folder_row, text="찾아보기",
+                  bg=C["btn"], fg="white", font=("Malgun Gothic", 9),
+                  relief=tk.FLAT, bd=0, padx=10, pady=4,
+                  cursor="hand2", command=_browse).pack(side=tk.LEFT, padx=(6, 0))
+
         tk.Frame(body, bg=C["border"], height=1).pack(fill=tk.X, pady=(0, 14))
-        tk.Label(body, text="문서 인덱싱",
-                 bg=C["main"], fg=C["text2"],
-                 font=("Malgun Gothic", 9, "bold")).pack(anchor="w", pady=(0, 6))
 
+        # ── AI 제공자 선택 ──
+        _lbl(body, "AI 제공자")
+        provider_var = tk.StringVar(value=self.config.get("provider", "Ollama"))
+        _combo(body, provider_var, list(PROVIDERS.keys()))
+
+        # 접속 URL
+        _lbl(body, "접속 URL")
+        url_var = tk.StringVar(value=self.config.get("base_url", ""))
+        url_ent = _entry(body, url_var)
+        url_ent.pack(fill=tk.X, pady=(0, 4), ipady=4)
+        tk.Label(body, text="Ollama: http://localhost:11434  |  LM Studio: http://localhost:1234/v1  |  Jan: http://localhost:1337/v1",
+                 bg=C["main"], fg=C["text2"],
+                 font=("Malgun Gothic", 8),
+                 wraplength=500, justify=tk.LEFT).pack(anchor="w", pady=(0, 14))
+
+        def _on_provider_change(*_):
+            pname = provider_var.get()
+            preset_url = PROVIDERS.get(pname, {}).get("url", "")
+            if preset_url:
+                url_var.set(preset_url)
+            _refresh_models()
+
+        provider_var.trace_add("write", _on_provider_change)
+
+        # ── 모델 선택 ──
+        _lbl(body, "LLM 모델")
+        model_var = tk.StringVar(value=self.config.get("model", ""))
+        model_cb  = ttk.Combobox(body, textvariable=model_var,
+                                  font=("Malgun Gothic", 10),
+                                  style="Dark.TCombobox")
+        model_cb.pack(fill=tk.X, pady=(0, 4), ipady=4)
+
+        refresh_btn = tk.Button(body, text="↺  모델 목록 새로고침",
+                                bg=C["sidebar_btn"], fg=C["text2"],
+                                font=("Malgun Gothic", 9),
+                                relief=tk.FLAT, bd=0, padx=10, pady=4,
+                                cursor="hand2")
+
+        def _refresh_models():
+            refresh_btn.config(state=tk.DISABLED, text="조회 중…")
+            pname = provider_var.get()
+            url   = url_var.get().strip() or PROVIDERS.get(pname, {}).get("url", "")
+
+            def _fetch():
+                models = []
+                try:
+                    if pname == "Ollama":
+                        models = [m.model for m in ollama.list().models]
+                    elif OPENAI_OK and url:
+                        models = _fetch_models_openai(url)
+                except Exception:
+                    pass
+                dlg.after(0, lambda m=models: _apply_models(m))
+
+            def _apply_models(models):
+                refresh_btn.config(state=tk.NORMAL, text="↺  모델 목록 새로고침")
+                if models:
+                    model_cb.config(values=models, state="readonly")
+                    if model_var.get() not in models:
+                        model_var.set(models[0])
+                else:
+                    model_cb.config(values=[], state="normal")
+
+            threading.Thread(target=_fetch, daemon=True).start()
+
+        refresh_btn.config(command=_refresh_models)
+        refresh_btn.pack(anchor="w", pady=(0, 14))
+
+        # 초기 모델 목록 로드
+        _on_provider_change()
+
+        tk.Frame(body, bg=C["border"], height=1).pack(fill=tk.X, pady=(0, 14))
+
+        # ── 인덱싱 ──
+        _lbl(body, "문서 인덱싱")
         log_box = tk.Text(body, bg=C["input_bg"], fg=C["text"],
                           font=("Malgun Gothic", 9),
-                          height=6, relief=tk.FLAT, bd=4,
+                          height=5, relief=tk.FLAT, bd=4,
                           state=tk.DISABLED)
         log_box.pack(fill=tk.X, pady=(0, 8))
 
@@ -729,11 +829,7 @@ class OllamaRAGApp:
             if not folder:
                 messagebox.showwarning("경고", "폴더를 먼저 선택하세요.", parent=dlg)
                 return
-            self.config["folder"] = folder
-            self.config["model"]  = model_var.get()
-            save_config(self.config)
-            self._refresh_status()
-
+            _apply_config()
             idx_btn.config(state=tk.DISABLED, text="인덱싱 중…")
             log_box.config(state=tk.NORMAL)
             log_box.delete("1.0", tk.END)
@@ -743,22 +839,28 @@ class OllamaRAGApp:
                 _log(f"폴더 스캔 중: {folder}")
                 added, skipped, errors = index_documents(folder, callback=_log)
                 _log(f"\n✅ 완료 — {added}청크 추가, {skipped}파일 생략, {errors}오류")
-                dlg.after(0, lambda: idx_btn.config(
-                    state=tk.NORMAL, text="▶  인덱싱 시작"))
+                dlg.after(0, lambda: idx_btn.config(state=tk.NORMAL,
+                                                    text="▶  인덱싱 시작"))
 
             threading.Thread(target=_run, daemon=True).start()
 
         idx_btn.config(command=_do_index)
 
-        # 하단 버튼
+        # ── 하단 버튼 ──
         btn_row = tk.Frame(dlg, bg=C["main"])
         btn_row.pack(fill=tk.X, padx=22, pady=16)
 
-        def _save_close():
-            self.config["folder"] = folder_var.get().strip()
-            self.config["model"]  = model_var.get()
+        def _apply_config():
+            self.config["folder"]   = folder_var.get().strip()
+            self.config["provider"] = provider_var.get()
+            self.config["base_url"] = url_var.get().strip() or \
+                                      PROVIDERS.get(provider_var.get(), {}).get("url", "")
+            self.config["model"]    = model_var.get()
             save_config(self.config)
             self._refresh_status()
+
+        def _save_close():
+            _apply_config()
             dlg.destroy()
 
         tk.Button(btn_row, text="저장 후 닫기",
