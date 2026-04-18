@@ -83,6 +83,42 @@ def _read_docx(path):
     doc = DocxDocument(str(path))
     return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
 
+def _read_rtf(path):
+    """RTF 파일에서 순수 텍스트 추출 (외부 라이브러리 불필요)"""
+    import re
+    raw = Path(path).read_bytes()
+    for enc in ["utf-8", "cp949", "euc-kr", "latin-1"]:
+        try:
+            text = raw.decode(enc)
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+    else:
+        text = raw.decode("latin-1")
+
+    # 유니코드 이스케이프 (\uN) 처리
+    def _uni(m):
+        try:
+            return chr(int(m.group(1)))
+        except Exception:
+            return ""
+    text = re.sub(r"\\u(-?\d+)\??", _uni, text)
+
+    # 줄바꿈 제어어 → 개행
+    text = re.sub(r"\\(par|line|pard)\b", "\n", text)
+    # 탭
+    text = re.sub(r"\\tab\b", "\t", text)
+    # 특수문자 이스케이프 (\' 헥스)
+    text = re.sub(r"\\'([0-9a-fA-F]{2})",
+                  lambda m: bytes.fromhex(m.group(1)).decode("cp1252", errors="replace"), text)
+    # 중괄호 그룹·제어어 제거
+    text = re.sub(r"\{[^{}]*\}", "", text)
+    text = re.sub(r"\\[a-zA-Z]+\-?\d*\s?", "", text)
+    text = re.sub(r"[{}\\]", "", text)
+    # 연속 공백 정리
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
 def _chunk(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     chunks, start = [], 0
     while start < len(text):
@@ -93,10 +129,15 @@ def _chunk(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
 def _file_hash(path):
     return hashlib.md5(Path(path).read_bytes()).hexdigest()
 
-def index_documents(folder, callback=None, force=False):
+def _ollama_client(base_url: str = ""):
+    """base_url이 있으면 원격 Ollama 클라이언트, 없으면 로컬"""
+    host = base_url.strip() or "http://localhost:11434"
+    return ollama.Client(host=host)
+
+def index_documents(folder, callback=None, force=False, ollama_url: str = ""):
     folder = Path(folder)
     docs = []
-    for pat, reader in [("*.txt", _read_txt), ("*.docx", _read_docx)]:
+    for pat, reader in [("*.txt", _read_txt), ("*.docx", _read_docx), ("*.rtf", _read_rtf)]:
         for f in folder.rglob(pat):
             try:
                 text = reader(f)
@@ -107,7 +148,7 @@ def index_documents(folder, callback=None, force=False):
                     callback(f"  [건너뜀] {f.name}: {e}")
     if not docs:
         if callback:
-            callback("지원 파일(.txt .docx)이 없습니다.")
+            callback("지원 파일(.txt .docx .rtf)이 없습니다.")
         return 0, 0, 0
 
     client = chromadb.PersistentClient(path=DB_PATH)
@@ -138,11 +179,12 @@ def index_documents(folder, callback=None, force=False):
 
         chunks = _chunk(doc["text"])
         ok = True
+        oc = _ollama_client(ollama_url)
         for i, chunk in enumerate(chunks):
             if not chunk.strip():
                 continue
             try:
-                emb = ollama.embeddings(model=EMBED_MODEL, prompt=chunk)["embedding"]
+                emb = oc.embeddings(model=EMBED_MODEL, prompt=chunk)["embedding"]
                 col.add(ids=[f"{fhash}_{i}"], embeddings=[emb], documents=[chunk],
                         metadatas=[{"source": doc["path"], "file_hash": fhash,
                                     "chunk_index": i, "filename": doc["name"]}])
@@ -170,42 +212,46 @@ def query_documents(question, model, top_k=5, provider="Ollama", base_url=""):
     try:
         client = chromadb.PersistentClient(path=DB_PATH)
         col = client.get_collection(COLLECTION)
-        if col.count() == 0:
+        total = col.count()
+        if total == 0:
             return "인덱싱된 문서가 없습니다. 설정 → 인덱싱을 먼저 실행하세요.", []
     except Exception:
         return "문서가 인덱싱되지 않았습니다. 설정 → 인덱싱을 먼저 실행하세요.", []
 
-    # 임베딩은 항상 Ollama 사용
-    try:
-        q_emb = ollama.embeddings(model=EMBED_MODEL, prompt=question)["embedding"]
-    except Exception as e:
-        return f"임베딩 오류: {e}", []
-
-    res = col.query(query_embeddings=[q_emb],
-                    n_results=min(top_k, col.count()),
-                    include=["documents", "metadatas"])
-
-    if not res["documents"] or not res["documents"][0]:
-        return "관련 문서를 찾지 못했습니다.", []
-
-    ctx_parts, sources = [], []
-    for doc, meta in zip(res["documents"][0], res["metadatas"][0]):
+    # 전체 청크를 파일별로 묶어서 가져오기
+    all_data = col.get(include=["documents", "metadatas"])
+    file_chunks: dict[str, list[str]] = {}
+    for doc, meta in zip(all_data["documents"], all_data["metadatas"]):
         fname = meta.get("filename", "?")
-        ctx_parts.append(f"[출처: {fname}]\n{doc}")
-        if fname not in sources:
-            sources.append(fname)
+        idx   = meta.get("chunk_index", 0)
+        if fname not in file_chunks:
+            file_chunks[fname] = []
+        file_chunks[fname].append((idx, doc))
+
+    # 파일별로 청크를 순서대로 정렬 후 전체 텍스트 재구성
+    ctx_parts, sources = [], []
+    for fname, chunks in file_chunks.items():
+        chunks.sort(key=lambda x: x[0])
+        full_text = "\n".join(c[1] for c in chunks)
+        ctx_parts.append(f"[파일: {fname}]\n{full_text}")
+        sources.append(fname)
 
     prompt = (
-        "다음은 문서에서 검색된 내용입니다:\n\n"
+        "당신은 아래 제공된 문서 내용만을 기반으로 답변하는 AI입니다.\n"
+        "절대로 문서에 없는 내용을 추측하거나 일반 지식으로 답변하지 마세요.\n"
+        "문서에서 답을 찾을 수 없으면 반드시 '제공된 문서에서 해당 내용을 찾을 수 없습니다.'라고만 답하세요.\n\n"
+        "=== 참조 문서 전체 ===\n\n"
         + "\n\n---\n\n".join(ctx_parts)
-        + "\n\n위 내용을 바탕으로 다음 질문에 한국어로 상세하게 답변하세요.\n"
-        "문서에 없는 내용은 \"문서에서 찾을 수 없습니다\"라고 답하세요.\n\n"
+        + "\n\n=== 참조 문서 끝 ===\n\n"
+        "위 문서 내용만 참고하여 아래 질문에 한국어로 상세하게 답변하세요.\n"
+        "파일명이나 출처는 언급하지 말고 내용만 답변하세요.\n\n"
         f"질문: {question}\n\n답변:"
     )
 
     try:
         if provider == "Ollama":
-            return ollama.generate(model=model, prompt=prompt)["response"], sources
+            oc = _ollama_client(base_url)
+            return oc.generate(model=model, prompt=prompt)["response"], sources
         else:
             # LM Studio / Jan / 직접 입력 — OpenAI 호환 API
             if not OPENAI_OK:
@@ -213,7 +259,13 @@ def query_documents(question, model, top_k=5, provider="Ollama", base_url=""):
             c = _OpenAIClient(base_url=base_url, api_key="not-needed")
             resp = c.chat.completions.create(
                 model=model,
-                messages=[{"role": "user", "content": prompt}]
+                messages=[
+                    {"role": "system", "content":
+                        "당신은 제공된 문서 내용만을 기반으로 답변하는 AI입니다. "
+                        "문서에 없는 내용은 절대 추측하거나 일반 지식으로 답변하지 마세요. "
+                        "문서에서 찾을 수 없는 내용은 '제공된 문서에서 해당 내용을 찾을 수 없습니다.'라고만 답하세요."},
+                    {"role": "user", "content": prompt}
+                ]
             )
             return resp.choices[0].message.content, sources
     except Exception as e:
@@ -242,8 +294,8 @@ class OllamaRAGApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Ollama RAG")
-        self.root.geometry("1150x720")
-        self.root.minsize(820, 520)
+        self.root.geometry("1150x800")
+        self.root.minsize(820, 600)
         self.root.configure(bg=C["main"])
 
         self.config = load_config()
@@ -307,10 +359,20 @@ class OllamaRAGApp:
             canvas.configure(scrollregion=canvas.bbox("all"))
         self.conv_frame.bind("<Configure>", _on_inner)
 
-        # 마우스 휠
+        # 마우스 휠 - 사이드바 영역에 마우스가 있을 때만 스크롤
         def _wheel(e):
             canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        canvas.bind_all("<MouseWheel>", _wheel)
+
+        def _bind_wheel(e):
+            canvas.bind_all("<MouseWheel>", _wheel)
+
+        def _unbind_wheel(e):
+            canvas.unbind_all("<MouseWheel>")
+
+        canvas.bind("<Enter>", _bind_wheel)
+        canvas.bind("<Leave>", _unbind_wheel)
+        self.conv_frame.bind("<Enter>", _bind_wheel)
+        self.conv_frame.bind("<Leave>", _unbind_wheel)
 
         # 설정 버튼 (하단)
         tk.Frame(self.sidebar, bg=C["border"], height=1).pack(fill=tk.X, padx=10)
@@ -338,10 +400,37 @@ class OllamaRAGApp:
                                   padx=18)
         self.title_lbl.pack(side=tk.LEFT, pady=14)
 
-        self.status_lbl = tk.Label(title_bar, text="",
+        # 우측 상태 영역 (폴더 | 모델버튼 | 프로바이더)
+        status_frame = tk.Frame(title_bar, bg=C["main"])
+        status_frame.pack(side=tk.RIGHT, pady=14, padx=18)
+
+        self.provider_lbl = tk.Label(status_frame, text="",
+                                     bg=C["main"], fg=C["text2"],
+                                     font=("Malgun Gothic", 9),
+                                     cursor="hand2")
+        self.provider_lbl.pack(side=tk.RIGHT)
+        self.provider_lbl.bind("<Button-1>", lambda e: self._show_provider_picker())
+        self.provider_lbl.bind("<Enter>", lambda e: self.provider_lbl.config(fg=C["accent"]))
+        self.provider_lbl.bind("<Leave>", lambda e: self.provider_lbl.config(fg=C["text2"]))
+
+        self.model_btn = tk.Label(status_frame, text="",
+                                  bg=C["main"], fg=C["accent"],
+                                  font=("Malgun Gothic", 9, "bold"),
+                                  cursor="hand2", padx=6)
+        self.model_btn.pack(side=tk.RIGHT)
+        self.model_btn.bind("<Button-1>", lambda e: self._show_model_picker())
+        self.model_btn.bind("<Enter>", lambda e: self.model_btn.config(fg=C["btn"]))
+        self.model_btn.bind("<Leave>", lambda e: self.model_btn.config(fg=C["accent"]))
+
+        self.folder_lbl = tk.Label(status_frame, text="",
                                    bg=C["main"], fg=C["text2"],
-                                   font=("Malgun Gothic", 9), padx=18)
-        self.status_lbl.pack(side=tk.RIGHT, pady=14)
+                                   font=("Malgun Gothic", 9),
+                                   cursor="hand2")
+        self.folder_lbl.pack(side=tk.RIGHT)
+        self.folder_lbl.bind("<Button-1>", lambda e: self._pick_folder())
+        self.folder_lbl.bind("<Enter>", lambda e: self.folder_lbl.config(fg=C["accent"]))
+        self.folder_lbl.bind("<Leave>", lambda e: self.folder_lbl.config(fg=C["text2"]))
+
         self._refresh_status()
 
         tk.Frame(right, bg=C["border"], height=1).pack(fill=tk.X)
@@ -389,8 +478,8 @@ class OllamaRAGApp:
         self._show_welcome()
 
         # 입력 영역
-        inp_outer = tk.Frame(right, bg=C["main"], padx=16, pady=10)
-        inp_outer.pack(fill=tk.X)
+        inp_outer = tk.Frame(right, bg=C["main"], padx=16, pady=12)
+        inp_outer.pack(fill=tk.X, side=tk.BOTTOM)
 
         inp_box = tk.Frame(inp_outer, bg=C["input_bg"],
                            highlightthickness=1,
@@ -400,9 +489,9 @@ class OllamaRAGApp:
 
         self.inp = tk.Text(inp_box,
                            bg=C["input_bg"], fg=C["text"],
-                           font=("Malgun Gothic", 10),
+                           font=("Malgun Gothic", 12),
                            relief=tk.FLAT, bd=0,
-                           padx=12, pady=10, height=8,
+                           padx=12, pady=10, height=6,
                            wrap=tk.WORD,
                            insertbackground=C["text"])
         self.inp.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -452,10 +541,204 @@ class OllamaRAGApp:
         model    = self.config.get("model", "gemma3:4b")
         provider = self.config.get("provider", "Ollama")
         if folder:
-            self.status_lbl.config(
-                text=f"📁 {Path(folder).name}   🤖 {model}   🔌 {provider}")
+            self.folder_lbl.config(text=f"📁 {Path(folder).name}   ")
         else:
-            self.status_lbl.config(text="⚙  설정에서 폴더를 지정하세요")
+            self.folder_lbl.config(text="⚙ 설정 필요   ")
+        self.model_btn.config(text=f"🤖 {model}   ")
+        self.provider_lbl.config(text=f"🔌 {provider}")
+
+    # ── 프로바이더 빠른 선택 팝업 ────────────────────────────────────────────
+    def _show_provider_picker(self):
+        popup = tk.Toplevel(self.root)
+        popup.title("AI 제공자 선택")
+        popup.configure(bg=C["main"])
+        popup.resizable(False, False)
+        popup.transient(self.root)
+        popup.grab_set()
+
+        bx = self.provider_lbl.winfo_rootx()
+        by = self.provider_lbl.winfo_rooty() + self.provider_lbl.winfo_height() + 4
+        popup.geometry(f"300x360+{bx}+{by}")
+
+        tk.Label(popup, text="AI 제공자 선택", bg=C["main"], fg=C["accent"],
+                 font=("Malgun Gothic", 10, "bold"), pady=10).pack()
+        tk.Frame(popup, bg=C["border"], height=1).pack(fill=tk.X, padx=10)
+
+        current_provider = self.config.get("provider", "Ollama")
+
+        body = tk.Frame(popup, bg=C["main"])
+        body.pack(fill=tk.BOTH, expand=True, padx=14, pady=10)
+
+        selected_var = tk.StringVar(value=current_provider)
+        url_var = tk.StringVar(value=self.config.get("base_url", ""))
+
+        for name in PROVIDERS:
+            row = tk.Frame(body, bg=C["main"])
+            row.pack(fill=tk.X, pady=2)
+            tk.Radiobutton(row, text=name, variable=selected_var, value=name,
+                           bg=C["main"], fg=C["text"],
+                           selectcolor=C["sidebar_btn"],
+                           activebackground=C["main"], activeforeground=C["accent"],
+                           font=("Malgun Gothic", 10),
+                           anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # 직접 입력 URL 필드
+        tk.Frame(body, bg=C["border"], height=1).pack(fill=tk.X, pady=(8, 4))
+        tk.Label(body, text="접속 URL (직접 입력 시 필수)", bg=C["main"], fg=C["text2"],
+                 font=("Malgun Gothic", 8)).pack(anchor="w")
+        url_entry = tk.Entry(body, textvariable=url_var,
+                             bg=C["sidebar_btn"], fg=C["text"],
+                             insertbackground=C["text"],
+                             font=("Malgun Gothic", 9),
+                             relief=tk.FLAT, bd=4)
+        url_entry.pack(fill=tk.X, pady=(2, 8), ipady=3)
+
+        def _on_select():
+            pname = selected_var.get()
+            url   = url_var.get().strip()
+            if pname != "직접 입력":
+                url = PROVIDERS[pname]["url"]
+            self.config["provider"] = pname
+            self.config["base_url"] = url
+            # 프로바이더가 바뀌면 모델도 초기화
+            self.config["model"] = ""
+            save_config(self.config)
+            self._refresh_status()
+            popup.destroy()
+            # 새 프로바이더의 기본 모델 자동 조회 후 첫 모델 선택
+            self._auto_pick_first_model()
+
+        tk.Frame(popup, bg=C["border"], height=1).pack(fill=tk.X, padx=10)
+        tk.Button(popup, text="선택", bg=C["btn"], fg="white",
+                  font=("Malgun Gothic", 10, "bold"),
+                  relief=tk.FLAT, bd=0, padx=14, pady=6,
+                  cursor="hand2", command=_on_select).pack(pady=8)
+
+    def _auto_pick_first_model(self):
+        """프로바이더 변경 후 첫 번째 모델을 자동으로 선택"""
+        provider = self.config.get("provider", "Ollama")
+        base_url = self.config.get("base_url", "").strip()
+        url = base_url or PROVIDERS.get(provider, {}).get("url", "")
+
+        def _fetch():
+            models = []
+            try:
+                if provider == "Ollama":
+                    models = [m.model for m in _ollama_client(url).list().models]
+                elif OPENAI_OK and url:
+                    models = _fetch_models_openai(url)
+            except Exception:
+                pass
+            if models:
+                self.root.after(0, lambda: self._set_model(models[0]))
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _set_model(self, model: str):
+        self.config["model"] = model
+        save_config(self.config)
+        self._refresh_status()
+
+    # ── 폴더 빠른 선택 ──────────────────────────────────────────────────────
+    def _pick_folder(self):
+        path = filedialog.askdirectory(title="문서 폴더 선택", parent=self.root)
+        if path:
+            self.config["folder"] = path
+            save_config(self.config)
+            self._refresh_status()
+
+    # ── 모델 빠른 선택 팝업 ──────────────────────────────────────────────────
+    def _show_model_picker(self):
+        provider = self.config.get("provider", "Ollama")
+        base_url = self.config.get("base_url", "").strip()
+        url = base_url or PROVIDERS.get(provider, {}).get("url", "")
+
+        popup = tk.Toplevel(self.root)
+        popup.title("모델 선택")
+        popup.configure(bg=C["main"])
+        popup.resizable(False, False)
+        popup.transient(self.root)
+        popup.grab_set()
+
+        # 팝업 위치: 모델 버튼 아래
+        bx = self.model_btn.winfo_rootx()
+        by = self.model_btn.winfo_rooty() + self.model_btn.winfo_height() + 4
+        popup.geometry(f"260x320+{bx}+{by}")
+
+        tk.Label(popup, text="모델 선택", bg=C["main"], fg=C["accent"],
+                 font=("Malgun Gothic", 10, "bold"), pady=10).pack()
+        tk.Frame(popup, bg=C["border"], height=1).pack(fill=tk.X, padx=10)
+
+        list_frame = tk.Frame(popup, bg=C["main"])
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        loading_lbl = tk.Label(list_frame, text="모델 목록 조회 중…",
+                               bg=C["main"], fg=C["text2"],
+                               font=("Malgun Gothic", 9))
+        loading_lbl.pack(pady=20)
+
+        current_model = self.config.get("model", "")
+
+        def _apply_models(models):
+            loading_lbl.destroy()
+            if not models:
+                tk.Label(list_frame, text="설치된 모델이 없습니다",
+                         bg=C["main"], fg=C["text2"],
+                         font=("Malgun Gothic", 9)).pack(pady=20)
+                return
+
+            sb = ttk.Scrollbar(list_frame, orient="vertical")
+            sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+            lb = tk.Listbox(list_frame,
+                            bg=C["sidebar_btn"], fg=C["text"],
+                            selectbackground=C["btn"],
+                            selectforeground="white",
+                            font=("Malgun Gothic", 10),
+                            relief=tk.FLAT, bd=0,
+                            activestyle="none",
+                            yscrollcommand=sb.set)
+            sb.config(command=lb.yview)
+            lb.pack(fill=tk.BOTH, expand=True)
+
+            for m in models:
+                lb.insert(tk.END, m)
+            if current_model in models:
+                idx = models.index(current_model)
+                lb.selection_set(idx)
+                lb.see(idx)
+
+            def _select(e=None):
+                sel = lb.curselection()
+                if not sel:
+                    return
+                chosen = lb.get(sel[0])
+                self.config["model"] = chosen
+                save_config(self.config)
+                self._refresh_status()
+                popup.destroy()
+
+            lb.bind("<Double-Button-1>", _select)
+            lb.bind("<Return>", _select)
+
+            tk.Frame(popup, bg=C["border"], height=1).pack(fill=tk.X, padx=10)
+            tk.Button(popup, text="선택", bg=C["btn"], fg="white",
+                      font=("Malgun Gothic", 10, "bold"),
+                      relief=tk.FLAT, bd=0, padx=14, pady=6,
+                      cursor="hand2", command=_select).pack(pady=8)
+
+        def _fetch():
+            models = []
+            try:
+                if provider == "Ollama":
+                    models = [m.model for m in _ollama_client(url).list().models]
+                elif OPENAI_OK and url:
+                    models = _fetch_models_openai(url)
+            except Exception:
+                pass
+            popup.after(0, lambda: _apply_models(models))
+
+        threading.Thread(target=_fetch, daemon=True).start()
 
     # ── 환영 메시지 ──────────────────────────────────────────────────────────
     def _show_welcome(self):
@@ -587,7 +870,7 @@ class OllamaRAGApp:
                              "ai_err" if is_err else "ai_msg")
             if sources:
                 self.chat.insert(tk.END,
-                                 f"📎 참조: {', '.join(sources)}\n", "ai_src")
+                                 f"📎 {', '.join(sources)}\n", "ai_src")
 
     # ── 메시지 전송 ──────────────────────────────────────────────────────────
     def _send(self):
@@ -775,7 +1058,7 @@ class OllamaRAGApp:
                 models = []
                 try:
                     if pname == "Ollama":
-                        models = [m.model for m in ollama.list().models]
+                        models = [m.model for m in _ollama_client(url).list().models]
                     elif OPENAI_OK and url:
                         models = _fetch_models_openai(url)
                 except Exception:
@@ -837,7 +1120,10 @@ class OllamaRAGApp:
 
             def _run():
                 _log(f"폴더 스캔 중: {folder}")
-                added, skipped, errors = index_documents(folder, callback=_log)
+                pname = provider_var.get()
+                ourl  = url_var.get().strip() if pname == "Ollama" else ""
+                added, skipped, errors = index_documents(folder, callback=_log,
+                                                         ollama_url=ourl)
                 _log(f"\n✅ 완료 — {added}청크 추가, {skipped}파일 생략, {errors}오류")
                 dlg.after(0, lambda: idx_btn.config(state=tk.NORMAL,
                                                     text="▶  인덱싱 시작"))
